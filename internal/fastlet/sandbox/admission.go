@@ -13,6 +13,7 @@ import (
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	fastletcache "fast-sandbox/internal/fastlet/cache"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
+	"fast-sandbox/internal/fastletsettings"
 	"fast-sandbox/internal/observability"
 	actionapi "fast-sandbox/internal/protocol/action"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
@@ -167,6 +168,9 @@ func (m *SandboxManager) prepareCreateInput(req *fastletapi.CreateSandboxRequest
 			Desired:  req.Sandbox.DeepCopy(),
 			Limits:   limits,
 		},
+	}
+	if req.Resources != nil && m.resourceAdmission != nil && m.resourceAdmission.Version == fastletsettings.BoundedFirecrackerVersion {
+		input.Sandbox.CPURequest = req.Resources.Requests.CPU
 	}
 	return input, nil
 }
@@ -549,6 +553,14 @@ func (m *SandboxManager) Recover(ctx context.Context) error { //nolint:gocognit 
 	if recoverer, ok := m.runtime.(RuntimeResourceRecoverer); ok {
 		if err := recoverer.RecoverRuntimeResources(ctx, managed); err != nil {
 			return fmt.Errorf("recover runtime resources: %w", err)
+		}
+		// Recovery may remove a dead VMM and release its slot. Import only
+		// surviving records into the admission ledger and route table.
+		if m.resourceAdmission != nil && m.resourceAdmission.Version == fastletsettings.BoundedFirecrackerVersion {
+			managed, err = m.runtime.ListManagedSandboxes(ctx)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	recovered := make(map[string]*SandboxMetadata, len(managed))
