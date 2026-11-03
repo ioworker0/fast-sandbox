@@ -26,6 +26,7 @@ import (
 	"fast-sandbox/internal/nodecleanup"
 	"fast-sandbox/internal/observability"
 	"fast-sandbox/internal/ocitemplate"
+	actionapi "fast-sandbox/internal/protocol/action"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 	"fast-sandbox/internal/runtime/firecracker/agent/hostready"
@@ -107,6 +108,14 @@ type Driver struct {
 	// fcVersion caches the last successfully resolved local Firecracker
 	// binary version (restore admission); unresolved lookups are retried.
 	fcVersion string
+	// metadataPublication tracks in-flight VM discovery payload writes
+	// (metadata.go): the payload goroutine never blocks EnsureSandbox, and
+	// tests wait on it to observe the record after provisioning returns.
+	metadataPublication sync.WaitGroup
+	// writeVMMetadataPayload emits the discovery record payload; stubbed in
+	// tests to hold publication mid-flight and prove EnsureSandbox does not
+	// wait for it.
+	writeVMMetadataPayload func(file *os.File, payload []byte) error
 }
 
 // defaultImageGCInterval bounds the image cache by usage without coupling GC
@@ -124,9 +133,10 @@ func New(profile runtimecatalog.RuntimeProfile) (*Driver, error) {
 		newClient: NewClient, stat: os.Stat, killProcess: killPID, probeProcess: pidAlive,
 		alignJailKVM: defaultAlignJailKVM,
 		waitSocket:   waitForAPISocket, processes: make(map[string]Process),
-		checkStorage:         checkStateRootStorage,
-		imageGCInterval:      defaultImageGCInterval,
-		imageCacheLimitBytes: defaultImageCacheLimitBytes,
+		checkStorage:           checkStateRootStorage,
+		writeVMMetadataPayload: writeVMMetadataPayload,
+		imageGCInterval:        defaultImageGCInterval,
+		imageCacheLimitBytes:   defaultImageCacheLimitBytes,
 	}, nil
 }
 
@@ -453,7 +463,7 @@ func (d *Driver) ProbeCapabilities(ctx context.Context) CapabilityReport {
 // snapshot set (an instance checkpoint when the request carries a resume
 // reference). The call is idempotent and emits an OTel span tree correlated
 // by the Sandbox identity.
-func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSandboxInput) (_ *SandboxMetadata, resultErr error) { //nolint:funlen,gocognit,gocyclo,maintidx // pre-existing create/resume state machine; refactor tracked separately
+func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSandboxInput) (_ *SandboxMetadata, resultErr error) { //nolint:gocognit,gocyclo,maintidx,funlen // pre-existing create/resume state machine; refactor tracked separately
 	if input == nil {
 		return nil, fmt.Errorf("%w: Firecracker Sandbox input is required", ErrInvalidConfig)
 	}
@@ -864,6 +874,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		"configure", configureDur.String(),
 		"boot", bootDur.String(), "vmStatePolls", polls,
 	)
+	d.publishVMMetadata(logDir, identity)
 	createdComplete = true
 	return existingMetadata(state), nil
 }
@@ -984,7 +995,7 @@ func (d *Driver) ListManagedSandboxes(_ context.Context) ([]*SandboxMetadata, er
 // RecoverRuntimeResources cleans up VMs that died with a Fastlet restart:
 // Firecracker processes are pod-local, so stale records are removed and
 // their slots released; surviving VMs are returned.
-func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*SandboxMetadata) error {
+func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*SandboxMetadata, retireOwner runtimecontract.ResourceRecoveryOwnerRetirer) error {
 	d.mu.RLock()
 	stateRoot := d.config.StateRoot
 	manager := d.networkManager
@@ -1008,7 +1019,7 @@ func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*Sandbox
 		}
 		alive, probeErr := d.probeVM(ctx, state)
 		if probeErr != nil || !alive {
-			if err := d.cleanupDeadRuntime(ctx, manager, runtimeCgroups, state, directory); err != nil {
+			if err := d.recoverDeadSandbox(ctx, state, directory, manager, runtimeCgroups, retireOwner); err != nil {
 				return err
 			}
 			continue
@@ -1024,13 +1035,10 @@ func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*Sandbox
 	return nil
 }
 
-func (d *Driver) cleanupDeadRuntime(
-	ctx context.Context,
-	manager *fastletnetwork.Manager,
-	runtimeCgroups *podcgroup.RuntimeManager,
-	state *SandboxState,
-	directory string,
-) error {
+// recoverDeadSandbox preserves retirement-before-release ordering for a dead
+// runtime. Retirement failure prevents slot release; strict slot-release
+// failure preserves the remaining cleanup state for a later retry.
+func (d *Driver) recoverDeadSandbox(ctx context.Context, state *SandboxState, directory string, manager *fastletnetwork.Manager, runtimeCgroups *podcgroup.RuntimeManager, retireOwner runtimecontract.ResourceRecoveryOwnerRetirer) error {
 	sandboxUID := state.Config.Identity.SandboxUID
 	pid := state.PID
 	if runtimeCgroups != nil {
@@ -1039,7 +1047,20 @@ func (d *Driver) cleanupDeadRuntime(
 		}
 		pid = 0
 	}
-	if manager != nil {
+	metadata := existingMetadata(state)
+	if retireOwner != nil {
+		if err := retireOwner(ctx, metadata); err != nil {
+			return fmt.Errorf("retire Action owner before recovering dead Firecracker sandbox %s: %w", state.Config.Identity.SandboxUID, err)
+		}
+	} else if version := state.Config.ActionsAPIVersion; version != "" && version != actionapi.APIVersion {
+		return fmt.Errorf("Actions apiVersion %q requires owner retirement before recovering dead Firecracker sandbox %s", version, state.Config.Identity.SandboxUID)
+	}
+	if manager != nil && state.Config.ActionsAPIVersion == actionapi.APIVersionV2 {
+		// Release also retries a Destroying slot; Lookup only sees Bound.
+		if err := manager.Release(ctx, d.networkOwner(&state.Config)); err != nil {
+			return fmt.Errorf("release retired Sandbox network slot: %w", err)
+		}
+	} else if manager != nil {
 		if _, exists := manager.Lookup(sandboxUID); exists {
 			if releaseErr := manager.Release(ctx, d.networkOwner(&state.Config)); releaseErr != nil {
 				klog.ErrorS(releaseErr, "Firecracker recovery failed to release the network slot", "sandboxID", sandboxUID)
